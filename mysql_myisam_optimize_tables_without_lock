@@ -1,0 +1,248 @@
+#!/usr/bin/perl
+# This script will do roughly the same as the 'optimize table'
+# command, but now you can continue using the table while the
+# optimization is being done. That's something I really needed for a
+# number of large, large and vital tables that needed cleaning up.
+
+# The script will not lock the table contrary to MySQL's "optimize
+# table", which is something I like for tables which are continuously
+# used. Of course there is a very small chance that a certain record
+# is missing when some query is looking for it, but that's the only
+# down-side. Oh, and of course this script takes a bit longer than
+# MySQL's optimize-table
+
+use Getopt::Std;
+use DBI;
+use Data::Dumper;
+use IO::Handle;
+
+my %opts;
+
+my $STEP_LIMIT = 20;
+my $SLEEPTIME = 1;
+
+main();
+
+
+sub main {
+    
+    getopts("d:t:f:s:vL:S:D:", \%opts);
+    my $database = $opts{'d'};
+    my $table = $opts{'t'};
+    my $datefield = $opts{'f'};
+    my $startdate = $opts{'s'};
+    my $delete_fields = $opts{'D'};
+
+    if (defined $opts{'v'}) {
+  $SLEEPTIME=$opts{'v'};
+    }
+    if (defined $opts{'L'}) {
+	$STEP_LIMIT=$opts{'L'};
+    }
+
+    if (!$database ||
+	!$table ||
+	!$datefield ||
+	!$startdate) {
+	error("No database, table, datefield or startdate!");
+    }
+
+    my $result = createMergeTable($table);
+    if (!$result) {
+	print STDERR "An error occurred. Exiting.\n";
+	exit(0);
+    }
+
+    $result = moveRecords($table, $datefield, $startdate);
+    if (!$result) {
+	print STDERR "An error occurred. Exiting.\n";
+	exit(0);
+    }
+
+    $result = unmergeTable($table);
+    if (!$result) {
+	print STDERR "An error occurred. Exiting.\n";
+	exit(0);
+    }
+}
+
+
+
+sub unmergeTable {
+    my $table = shift;
+
+    my $dbh = getDbh();
+    my $sth = $dbh->prepare("DROP TABLE $table");
+    $sth->execute();
+    $sth = $dbh->prepare("RENAME TABLE insert_$table TO $table");
+    $sth->execute();
+    print STDERR "Table $table is now unmerged.\n";
+    return 1;
+}
+
+
+
+
+sub moveRecords {
+    my $table = shift;
+    my $datefield = shift;
+    my $startdate = shift;
+
+
+    my $end=0;
+    print STDERR "Moving data...\n";
+    my $dbh = getDbh();
+    my $delete_fields = $opts{'D'};
+    if ($delete_fields) {
+        $delete_fields=~s/,/|/;
+        $delete_fields="($delete_fields)";
+    }
+
+    while (!$end) {
+	my $sth = $dbh->prepare("SELECT * FROM archive_$table WHERE $datefield>'$startdate' LIMIT $STEP_LIMIT") or die ($sth->errstr());
+	$sth->execute() or die ($sth->errstr());
+	if ($sth->rows() < 1 ) {
+	    $end=1;
+	}
+	while (my $row = $sth->fetchrow_hashref()) {
+	    # delete record
+	    my $delete_sql;
+	    my @values;
+            if (!$opts{'D'}) {
+                $delete_sql = "DELETE FROM archive_$table WHERE ".
+                  join(" AND ", map {"$_=?"} sort keys %$row);
+		@delete_values = map {$row->{$_}} sort keys %$row;
+            } else {
+                $delete_sql = "DELETE FROM archive_$table WHERE ".
+                  join(" AND ", map {"$_=?"} sort grep {/$delete_fields/} keys %$row);
+		@delete_values = map {$row->{$_}} sort grep {/$delete_fields/} keys %$row;
+            }
+	    # rewrite the null-fields in the query...
+	    $delete_sql=~s/ ([a-z_]+)=NULL / ISNULL($1) /gis;
+
+	    print STDERR "DELETE RECORD: $delete_sql ('".
+		join("', '",@delete_values)."')\n" if ($opts{'v'});
+	    my $sth = $dbh->prepare($delete_sql) or die ($sth->errstr());
+	    $sth->execute(@delete_values) or die ($sth->errstr());
+            print STDERR "Rows: ".$sth->rows()."\n";
+
+
+	    # insert record
+	    my $insert_sql = "INSERT INTO $table (".
+		join(",", sort keys %$row). ") VALUES (".
+		join(", ", map {"?"} sort keys %$row).
+		")";
+	    print STDERR "INSERT RECORD: $insert_sql\n" if ($opts{'v'});
+	    $sth = $dbh->prepare($insert_sql) or die ($sth->errstr());
+	    $sth->execute(map{$row->{$_}} sort keys %$row) or die ($sth->errstr());
+
+	}
+        sleep($SLEEPTIME) if ($SLEEPTIME);
+    }
+    return 1;
+}
+
+
+
+sub sql_escape {
+    my $term = shift;
+    $term=~s/'/\\'/gs;
+    return "'$term'";
+}
+
+
+
+
+
+
+
+sub createMergeTable {
+    my $table = shift;
+
+    my $dbh = getDbh();
+    my $sth = $dbh->prepare("SHOW CREATE TABLE $table") or die ($sth->errstr());
+    $sth->execute() or die ($sth->errstr());
+    my @creates = $sth->fetchrow_array();
+    print STDERR Dumper(\@creates) if ($opts{'v'});
+    my $create  = $creates[1];
+
+    if ($create!~/CREATE TABLE/) {
+	error("No valid CREATE TABLE from show-create-table $table : $create");
+    }
+
+    if ($create=~/UNION=/ || $create=~/ mrg_/) {
+	print STDERR "Table already in UNION mode - care to continue? ";
+	flush STDIN;
+	my $yesno = <>;
+	if ($yesno && $yesno=~/^y/i) {
+	    print STDERR "You answered YES. Continuing...\n";
+	    return 1;
+	} else {
+	    error("User wishes to quit.");
+	}
+    }
+
+    my $TABLE_TYPE = "ENGINE=MRG_MyISAM DEFAULT CHARSET=utf8 INSERT_METHOD=LAST UNION=(archive_$table, insert_$table)";
+
+    $create=~s/ ENGINE.*/ $TABLE_TYPE/gs;
+
+    print STDERR "CREATE: $create\n\n" if ($opts{'v'});
+
+    $sth = $dbh->prepare("RENAME TABLE $table TO archive_$table") or die ($sth->errstr());
+    $sth->execute() or die ($sth->errstr());
+
+    $sth = $dbh->prepare("CREATE TABLE insert_$table LIKE archive_$table") or die ($sth->errstr());
+    $sth->execute() or die ($sth->errstr());
+
+    $sth = $dbh->prepare($create) or die ($sth->errstr());
+    $sth->execute() or die ($sth->errstr());
+    return 1;
+}
+
+
+
+
+sub getDbh {
+    my $database = $opts{'d'};
+    if (!$database) {
+	error("database parameter enot found - how did this happen?");
+    }
+    $dbh = DBI->connect("dbi:mysql:database=$database;mysql_enable_utf8=1", 'root');
+    if (!$dbh) {
+	error("dbh not created - did you misspell the database name?");
+    }
+    # make sure we get UF8 flags!
+    $dbh->{mysql_enable_utf8} =1;
+
+    return $dbh;
+}
+
+
+
+
+sub error {
+    my $err = shift;
+    print STDERR "ERROR: $err\n\n";
+    print STDERR "reduce_table.pl\n\nReduces a table's size by creating a merge-table and slowly\n".
+	"moving current data from the old table to a new table. Old data will reside in the\n".
+	"old table and can be moved after some time.\n";
+    print STDERR "In the even of an unlucky CTRL+C, reduce_table will continue where it left\n".
+	"off when you restart the script. But only if you say 'Yes' in a nice way.\n";
+    print STDERR "Be aware: reduce_table cannot reduce merge-tables!\n\n"; 
+    print STDERR "Usage: reduce_table.pl -d <DATABASE> -t <TABLE> -f <TABLEDATEFIELD> ".
+      "-s <START_DATETIME> [-L STEP_LIMIT] [-S SLEEPTIME] ".
+#      "[-D <DELETE_FIELDS>] ".
+      "[-v]\n";
+    print STDERR "-d\tdatabase name\n";
+    print STDERR "-t\ttable name - this should NOT be a merge table to start with!\n";
+    print STDERR "-f\tfield in the table used to select the data to move\n";
+    print STDERR "-s\tstart value of the records ; all values above will be moved\n";
+    print STDERR "-L\tbatch size limit\n";
+    print STDERR "-S\tsleeptime between fetch+insert batches\n";
+    print STDERR "-v\tverbose output\n";
+    print STDERR "\n\nExamples:\n\treduce_table.pl -d wapapp -t mytable -f insert_date -s '2009-01-01 00:00:00' -L 20 -S 3 -v\n";
+    print STDERR "\treduce_table.pl -d wapapp -t mytable -f id -s 15000 -L 50 -S 1 -v\n";
+
+#    print STDERR "-D\tcomma separated list of fields which are used to delete entries\n";
+    exit(0);
+}
